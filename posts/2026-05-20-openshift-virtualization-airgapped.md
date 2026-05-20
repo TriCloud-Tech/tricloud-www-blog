@@ -1,189 +1,184 @@
 ---
 title: OpenShift Virtualization (KubeVirt) in Airgapped Environments
 date: 2026-05-20
-excerpt: A deep-dive into running OpenShift Virtualization in fully disconnected networks — covering architecture, image mirroring with oc-mirror, the HyperConverged Operator, and the new aba toolchain.
+excerpt: Getting OpenShift Virtualization running in a fully disconnected network is absolutely doable — it just needs more upfront planning than the docs let on. Here's the full picture.
 image: https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=1200&q=80
 ---
 
 # OpenShift Virtualization (KubeVirt) in Airgapped Environments
 
-Many regulated industries — defence, financial services, critical national infrastructure — mandate that workloads run on networks that have **zero egress to the public internet**. Running OpenShift Virtualization (the productised form of KubeVirt) in these environments requires extra planning: every container image, every operator catalogue, and every boot source must be pre-staged inside the enclave before a single VM can start.
+If you work in defence, financial services, or any sector where the security team's answer to most questions is "no internet", you'll know that "just install it" is never quite that simple. OpenShift Virtualization is no exception. Every container image, every operator bundle, every VM boot source needs to already be inside the network before you can do anything useful.
 
-This post walks through the full picture: what OpenShift Virtualization actually is, how its components are structured, and exactly what you need to do to get it running when `registry.redhat.io` is simply unreachable.
+This isn't a post that will tell you it's easy — but it's also not as bad as it sounds. Once you understand the moving parts and get the mirroring sorted, the actual cluster experience is pretty much identical to a connected one.
 
 ---
 
 ## What is OpenShift Virtualization?
 
-OpenShift Virtualization is Red Hat's productised distribution of [KubeVirt](https://kubevirt.io), an upstream CNCF project that adds VM lifecycle management as a first-class Kubernetes primitive. It uses Linux KVM under the hood, exposing VMs as `VirtualMachine` custom resources inside an OCP cluster. The result is a single control plane for both container and VM workloads, enabling teams to migrate legacy VM-based applications at their own pace without needing a separate virtualisation platform.
+Short version: it's Red Hat's productised packaging of [KubeVirt](https://kubevirt.io), a CNCF project that treats VMs as first-class Kubernetes objects. Under the hood it uses KVM, and your VMs appear as `VirtualMachine` custom resources sitting alongside your regular pods. The appeal for most organisations is that you get a single control plane for both containers and VMs, which means you can migrate off your legacy virtualisation platform at whatever pace suits the business rather than doing a big-bang cutover.
 
-IBM ships and supports OpenShift Virtualization as part of its **Red Hat OpenShift Virtualization Service on IBM Cloud** offering, targeting customers who want to consolidate VM and container estates onto a single, Kubernetes-native platform.
+IBM ships it as the [Red Hat OpenShift Virtualization Service on IBM Cloud](https://www.ibm.com/products/openshift-virtualization) for customers who want to consolidate VM and container estates — same technology, different delivery model.
 
 > "OpenShift Virtualization uses KubeVirt and KVM to allow teams to migrate and operate VM-based applications directly inside Red Hat OpenShift."  
-> — [IBM Cloud, Red Hat OpenShift Virtualization Service](https://www.ibm.com/products/openshift-virtualization)
+> — [IBM Cloud](https://www.ibm.com/products/openshift-virtualization)
 
 ---
 
-## Architecture Overview
+## How It's Actually Structured
 
-OpenShift Virtualization is not a single operator — it is a layered stack of operators co-ordinated by a single meta-operator called the **HyperConverged Operator (HCO)**.
+One thing that catches people out early: OpenShift Virtualization isn't a single operator you install and walk away from. It's a stack of operators, all coordinated by a meta-operator called the **HyperConverged Operator (HCO)**. The HCO is your single install point — it creates and manages everything else.
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                  OpenShift Container Platform                    │
-│                                                                  │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │           HyperConverged Operator  (HCO)                 │   │
-│  │                                                          │   │
-│  │   ┌────────────┐  ┌─────────────┐  ┌─────────────────┐  │   │
-│  │   │  KubeVirt  │  │  CDI (Cont. │  │  Cluster Network│  │   │
-│  │   │  Operator  │  │  Data Impr) │  │  Addons (CNA)   │  │   │
-│  │   └─────┬──────┘  └──────┬──────┘  └────────┬────────┘  │   │
-│  │         │                │                  │            │   │
-│  │   ┌─────▼──────┐  ┌──────▼──────┐  ┌────────▼────────┐  │   │
-│  │   │virt-api    │  │ cdi-apisvr  │  │ multus-cni      │  │   │
-│  │   │virt-ctrl   │  │ cdi-ctrl    │  │ linux-bridge-cni│  │   │
-│  │   │virt-handler│  │ cdi-deployer│  │ ovs-cni         │  │   │
-│  │   │virt-operator│ └─────────────┘  └─────────────────┘  │   │
-│  │   └────────────┘                                         │   │
-│  │                                                          │   │
-│  │   ┌─────────────────────┐  ┌──────────────────────────┐  │   │
-│  │   │ SSP Operator        │  │ Hostpath Provisioner     │  │   │
-│  │   │ (scheduling, scale) │  │ Operator (HPP)           │  │   │
-│  │   └─────────────────────┘  └──────────────────────────┘  │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │  Worker Nodes                                            │   │
-│  │  ┌──────────────┐  ┌────────────────────────────────┐   │   │
-│  │  │ virt-handler │  │  QEMU / libvirt / KVM          │   │   │
-│  │  │  (DaemonSet) │  │  (per-node hypervisor layer)   │   │   │
-│  │  └──────────────┘  └────────────────────────────────┘   │   │
-│  └──────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────┘
+
+```mermaid
+graph TD
+    HCO["🎛️ HyperConverged Operator (HCO)"]
+
+    HCO --> KV["KubeVirt Operator"]
+    HCO --> CDI["CDI — Containerized Data Importer"]
+    HCO --> CNA["Cluster Network Addons (CNA)"]
+    HCO --> SSP["SSP Operator"]
+    HCO --> HPP["Hostpath Provisioner (HPP)"]
+
+    KV --> VA["virt-api"]
+    KV --> VC["virt-controller"]
+    KV --> VH["virt-handler (DaemonSet)"]
+    KV --> VO["virt-operator"]
+
+    CDI --> CA["cdi-apiserver"]
+    CDI --> CC["cdi-controller"]
+    CDI --> CD["cdi-deployer"]
+
+    CNA --> MC["multus-cni"]
+    CNA --> LB["linux-bridge-cni"]
+    CNA --> OV["ovs-cni"]
 ```
 
-### Component Breakdown
 
-| Component | Role |
+Here's what each piece actually does:
+
+| Component | What it does |
 |---|---|
-| **HyperConverged Operator (HCO)** | Single entry-point meta-operator; creates CRs for all sub-operators and enforces opinionated defaults |
-| **virt-operator** | Manages KubeVirt lifecycle; reconciles the `KubeVirt` CR |
-| **virt-api** | Kubernetes API extension; handles VM CRD operations |
-| **virt-controller** | Control-plane daemon; schedules and manages `VirtualMachineInstance` pods |
-| **virt-handler** | Node-level DaemonSet; interfaces with QEMU/libvirt on each worker |
-| **CDI (Containerized Data Importer)** | Imports VM disk images into PVCs via `DataVolume` CRs |
-| **CNA (Cluster Network Addons)** | Deploys Multus, Linux Bridge CNI, OVS CNI for VM networking |
-| **SSP Operator** | Manages scheduling scale and performance policies for VMs |
-| **HPP Operator** | Provides hostpath-based persistent storage for VM disks |
+| **HCO** | The meta-operator. Creates CRs for everything below it and enforces sane defaults |
+| **virt-operator** | Manages the KubeVirt lifecycle — reconciles the `KubeVirt` CR |
+| **virt-api** | The API extension that handles all your VM custom resource operations |
+| **virt-controller** | Schedules and manages `VirtualMachineInstance` pods |
+| **virt-handler** | Runs as a DaemonSet on every worker node, talks directly to QEMU/libvirt |
+| **CDI** | Imports VM disk images into PVCs using `DataVolume` — how your VM disks get onto the cluster |
+| **CNA** | Gets Multus, Linux Bridge CNI, and OVS CNI onto your nodes for VM networking |
+| **SSP** | Handles scheduling, scale, and performance tuning for VMs |
+| **HPP** | Provides hostpath-based storage for VM disks when you don't have a fancy CSI |
 
 > Source: [Red Hat OpenShift Virtualization Architecture, OCP 4.12](https://docs.redhat.com/en/documentation/openshift_container_platform/4.12/html/virtualization/virt-architecture)
 
 ---
 
-## The Airgap Challenge
+## Why Airgapping Is Actually Hard Here
 
-In a standard connected deployment, the Operator Lifecycle Manager (OLM) reaches out to `registry.redhat.io` and `quay.io` to:
+In a normal connected deployment, OLM just reaches out to `registry.redhat.io` and `quay.io`, grabs the operator catalogue, resolves the bundle, and pulls whatever images it needs. It's all automatic and mostly invisible.
 
-1. Pull the operator catalogue index image
-2. Resolve the operator bundle
-3. Pull component container images on first install and on upgrades
+In an airgapped environment, none of that works. The calls silently fail or time out, and you're left with operators stuck in `Pending` with unhelpful error messages. What you need to do instead:
 
-In an airgapped environment **none of these calls can succeed**. You must:
+- Mirror every required image to a registry inside the enclave
+- Swap out the default `CatalogSource` for one pointing at your mirror
+- Apply an `ImageContentSourcePolicy` (or `ImageDigestMirrorSet` on OCP 4.13+) so every image pull gets silently redirected to your mirror
 
-- Mirror all required images to a private registry inside the enclave
-- Replace the default `CatalogSource` with one pointing at your mirror
-- Apply an `ImageContentSourcePolicy` (or `ImageDigestMirrorSet` in OCP 4.13+) so every image pull is transparently redirected
+The flow looks like this:
 
+
+```mermaid
+flowchart LR
+    subgraph internet["Connected Zone"]
+        RH["registry.redhat.io"]
+        Q["quay.io"]
+        CDN["Red Hat CDN"]
+    end
+
+    subgraph enclave["Airgapped Enclave"]
+        MR["🗄️ Mirror Registry\nQuay / Harbor / Nexus"]
+
+        subgraph cluster["OpenShift Cluster"]
+            OLM["OLM"]
+            CS["CatalogSource\n(mirrored)"]
+            ICSP["ICSP / IDMS\nredirects all pulls"]
+        end
+    end
+
+    internet -->|"one-time copy\n(USB / data diode)"| MR
+    OLM --> CS
+    CS --> ICSP
+    ICSP --> MR
 ```
-┌───────────────────────┐          ┌──────────────────────────────┐
-│   CONNECTED ZONE      │          │   AIRGAPPED ENCLAVE          │
-│                       │          │                              │
-│  registry.redhat.io ──┼──────────┼──▶  Mirror Registry         │
-│  quay.io              │  (one-   │     (Quay, Harbor, Nexus…)   │
-│  Red Hat CDN          │   time   │                              │
-│                       │  copy)   │  ┌────────────────────────┐  │
-│                       │          │  │  OpenShift Cluster     │  │
-│                       │          │  │                        │  │
-│                       │          │  │  OLM ──▶ CatalogSource │  │
-│                       │          │  │          (mirrored)    │  │
-│                       │          │  │                        │  │
-│                       │          │  │  ICSP / IDMS redirects │  │
-│                       │          │  │  all pulls to mirror   │  │
-│                       │          │  └────────────────────────┘  │
-└───────────────────────┘          └──────────────────────────────┘
-```
+
 
 ---
 
-## Three Deployment Scenarios
+## Which Scenario Are You Actually In?
 
-### Scenario 1 — Partially Connected (Proxy)
+### Partially Connected — Proxy
 
-The cluster has outbound internet access via an HTTP/S proxy. OCP and OLM can be configured with `proxy` settings; no image mirroring is strictly required, though mirroring still reduces egress and improves pull performance.
+You've got outbound internet via an HTTP/S proxy. OCP and OLM can be configured with proxy settings and things more or less work without full mirroring. It's simpler to set up but you're still dependent on external availability, and the proxy whitelist will bite you (more on that in the Nice To Knows below).
 
-### Scenario 2 — Fully Disconnected (Mirror-to-Registry)
+### Fully Disconnected — Mirror to Registry
 
-A bastion host with internet access mirrors images to a portable disk (tar file). The disk is physically moved into the enclave and loaded into the internal mirror registry. This is the most common scenario for government and defence deployments.
+This is the classic scenario for government and defence. A bastion host with internet access does a one-time mirror to a tar file on portable media. That media goes through your transfer process into the enclave, gets loaded into the internal registry, and from that point the cluster is completely self-contained. It's more work upfront, but once it's done, it's done.
 
-### Scenario 3 — Developer Preview — ISO-Embedded (OCP 4.19+)
+### Agent ISO — OCP 4.19+ (Developer Preview)
 
-Red Hat introduced a new **Agent ISO** approach in OCP 4.19 (Developer Preview). A single ~40 GB ISO is pre-loaded with the full OCP 4.19 release payload **plus** the virtualization operators. No pre-existing internal registry is required for initial bootstrap.
+Red Hat shipped something interesting in OCP 4.19: a single ~40 GB Agent ISO that contains the full OCP release payload *and* the virtualization operators baked in. No pre-existing internal registry needed to get started.
 
 > "Seamless deployment in air-gapped networks without a pre-existing image registry."  
-> — [Red Hat Developer, Disconnected OpenShift Virtualization Made Easy, August 2025](https://developers.redhat.com/articles/2025/08/15/disconnected-openshift-virtualization-made-easy)
+> — [Red Hat Developer, August 2025](https://developers.redhat.com/articles/2025/08/15/disconnected-openshift-virtualization-made-easy)
+
+It's still Developer Preview, so weigh that up for production use — but it's a promising direction.
 
 ---
 
 ## Method 1: Mirror-to-Registry with `oc-mirror`
 
-This is the **production-recommended approach** for OCP 4.11–4.19 clusters in fully disconnected environments.
+This is the approach you'd use for most production airgapped deployments running OCP 4.11 through 4.19.
 
-### Prerequisites
+### What you need before you start
 
-- A RHEL 8/9 bastion host with internet access (used once for mirroring)
-- A private container registry inside the enclave (e.g. Red Hat Quay, Harbor, Nexus Repository)
-- OpenShift CLI (`oc`) + `oc-mirror` plugin installed on the bastion
-- A valid Red Hat pull secret from [console.redhat.com](https://console.redhat.com)
+- A RHEL 8/9 bastion host with internet access — you only need this for the mirroring step
+- A private registry already running inside the enclave (Red Hat Quay, Harbor, Nexus, whatever you've got)
+- `oc` CLI and the `oc-mirror` plugin installed on the bastion
+- A Red Hat pull secret from [console.redhat.com](https://console.redhat.com)
 
-### Step 1 — Install `oc-mirror`
+### Step 1 — Get `oc-mirror` installed
 
 ```bash
 tar xvzf oc-mirror.tar.gz
 chmod +x oc-mirror
 sudo mv oc-mirror /usr/local/bin/
 
-# Verify
 oc mirror help
 ```
 
-### Step 2 — Configure credentials
+### Step 2 — Set up your credentials
 
 ```bash
-# Place your pull secret where podman/skopeo can find it
 mkdir -p ~/.docker
 cat ./pull-secret | jq . > ~/.docker/config.json
 
-# Verify login
 podman login registry.redhat.io
 ```
 
-### Step 3 — Discover the OpenShift Virtualization operator
+### Step 3 — Find the right operator package and channel
 
 ```bash
-# List available operator packages in the Red Hat catalog
 oc mirror list operators \
   --catalog=registry.redhat.io/redhat/redhat-operator-index:v4.17 \
   --package=kubevirt-hyperconverged
 
-# Find available channels and versions
 oc mirror list operators \
   --catalog=registry.redhat.io/redhat/redhat-operator-index:v4.17 \
   --package=kubevirt-hyperconverged \
   --channel=stable
 ```
 
-### Step 4 — Create an `ImageSetConfiguration`
+### Step 4 — Write your `ImageSetConfiguration`
+
+This is the file that tells `oc-mirror` exactly what to pull. Get this right and the rest is mechanical.
 
 ```yaml
 # virt-mirror-config.yaml
@@ -204,19 +199,20 @@ mirror:
     - name: kubevirt-hyperconverged      # OpenShift Virtualization / HCO
       channels:
       - name: stable
-    - name: local-storage-operator       # Required for VM disk storage
+    - name: local-storage-operator
       channels:
       - name: stable
-    - name: odf-operator                 # Optional — OpenShift Data Foundation
+    - name: odf-operator                 # Optional — ODF for VM disk storage
       channels:
       - name: stable-4.17
   additionalImages:
-  # Common VM boot sources (Fedora, RHEL, Windows)
   - name: registry.redhat.io/rhel8/rhel-guest-image:latest
   - name: registry.redhat.io/rhel9/rhel-guest-image:latest
 ```
 
-### Step 5 — Mirror to disk (on bastion, internet-connected)
+### Step 5 — Mirror to disk
+
+Run this on the bastion while you still have internet:
 
 ```bash
 mkdir /mnt/virt-mirror-disk
@@ -226,52 +222,51 @@ oc mirror --verbose 3 \
   file:///mnt/virt-mirror-disk
 ```
 
-This produces a tar archive (`mirror_seq1_000000.tar`) containing all layers and manifests. Transfer this to your enclave via approved media (USB, courier disk, data diode).
+You'll end up with a `mirror_seq1_000000.tar`. Put it on whatever media your transfer process accepts — USB, courier disk, data diode — and move it into the enclave.
 
-### Step 6 — Load images into the internal registry (inside enclave)
+### Step 6 — Load images into your internal registry
+
+From inside the enclave:
 
 ```bash
-# On a host inside the enclave with access to the mirror registry
 oc mirror --verbose 3 \
   --from=./mirror_seq1_000000.tar \
   docker://registry.internal.example.com:5000/openshift4
 ```
 
-`oc-mirror` writes its generated manifests to `oc-mirror-workspace/results-*/`:
+`oc-mirror` drops a set of generated manifests into `oc-mirror-workspace/results-*/` that you'll need for the next step:
 
 ```
 oc-mirror-workspace/
 └── results-1234567890/
-    ├── imageContentSourcePolicy.yaml      # Image redirect rules
+    ├── imageContentSourcePolicy.yaml
     ├── catalogSource-redhat-catalog-v4-17.yaml
     └── mapping.txt
 ```
 
-### Step 7 — Apply cluster-wide image redirect rules
+### Step 7 — Wire up the cluster to use your mirror
 
 ```bash
-# Disable the default (internet-facing) OperatorHub sources
+# Kill the default internet-facing catalog sources
 oc patch OperatorHub cluster --type json \
   -p '[{"op": "add", "path": "/spec/disableAllDefaultSources", "value": true}]'
 
-# Apply the ImageContentSourcePolicy (ICSP)
+# Tell the cluster to redirect image pulls to your mirror
 oc apply -f oc-mirror-workspace/results-*/imageContentSourcePolicy.yaml
 
-# Register the mirrored catalog
+# Register your mirrored catalog with OLM
 oc apply -f oc-mirror-workspace/results-*/catalogSource-redhat-catalog-v4-17.yaml
 ```
 
-After applying the ICSP, the cluster-wide `MachineConfigPool` will roll out an update to all nodes — **this causes a rolling reboot**. Plan for this maintenance window.
+**Heads up:** applying the ICSP triggers a rolling node reboot via `MachineConfigPool`. Build this into your maintenance window — it's not instant.
 
-### Step 8 — Install the HyperConverged Operator via OLM
+### Step 8 — Install the HyperConverged Operator
 
-Once nodes are back and the mirrored `CatalogSource` is healthy:
+Once nodes are back and the `CatalogSource` shows healthy:
 
 ```bash
-# Create the target namespace
 oc create namespace openshift-cnv
 
-# Create the OperatorGroup
 cat <<EOF | oc apply -f -
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
@@ -283,7 +278,6 @@ spec:
   - openshift-cnv
 EOF
 
-# Create the Subscription
 cat <<EOF | oc apply -f -
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
@@ -291,7 +285,7 @@ metadata:
   name: hco-operatorhub
   namespace: openshift-cnv
 spec:
-  source: redhat-catalog-v4-17          # Your mirrored catalog name
+  source: redhat-catalog-v4-17
   sourceNamespace: openshift-marketplace
   name: kubevirt-hyperconverged
   startingCSV: kubevirt-hyperconverged-operator.v4.17.0
@@ -309,101 +303,78 @@ metadata:
   name: kubevirt-hyperconverged
   namespace: openshift-cnv
 spec:
-  # Disable boot source auto-update — not useful in airgapped environments
-  # where no external image sources are reachable
   featureGates:
-    enableCommonBootImageImport: false
+    enableCommonBootImageImport: false   # disable CDN boot source pulls
 EOF
 ```
 
-Verify all HCO components become ready:
+Check everything came up:
 
 ```bash
 oc get csv -n openshift-cnv
-oc get hyperconverged kubevirt-hyperconverged -n openshift-cnv -o jsonpath='{.status.conditions}' | jq .
+oc get hyperconverged kubevirt-hyperconverged -n openshift-cnv \
+  -o jsonpath='{.status.conditions}' | jq .
 ```
 
 ---
 
-## Method 2: `aba` Automation Tool (OCP 4.19+)
+## Method 2: `aba` (OCP 4.19+)
 
-For teams deploying repeatedly or who want a more opinionated, tested workflow, Red Hat has released **aba** — an open-source CLI that wraps `oc-mirror` v2, the Agent-Based Installer, and Mirror Registry for Red Hat OpenShift into a single automation layer.
+If you're doing this more than once, or you want something repeatable and tested rather than a collection of shell one-liners, take a look at [aba](https://developers.redhat.com/articles/2025/10/14/simplify-openshift-installation-air-gapped-environments). It's an open-source CLI from Red Hat that wraps `oc-mirror` v2, the Agent-Based Installer, and Mirror Registry into one workflow.
 
-> "Aba packages everything you need in one place — install images, CLI tools, registry setup, and automation — enabling repeatable, tested workflows across disconnected deployments."  
-> — [Red Hat Developer, Simplify OpenShift Installation in Air-Gapped Environments, October 2025](https://developers.redhat.com/articles/2025/10/14/simplify-openshift-installation-air-gapped-environments)
+> "Aba packages everything you need in one place — install images, CLI tools, registry setup, and automation."  
+> — [Red Hat Developer, October 2025](https://developers.redhat.com/articles/2025/10/14/simplify-openshift-installation-air-gapped-environments)
 
-### Workflow (Fully Disconnected — 3 Steps)
+The entire install comes down to three stages:
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  STEP 1 — Bastion Preparation (internet-connected)              │
-│                                                                  │
-│  Download install bundle:  4.19.12-ocpv                         │
-│  (includes OCP + ODF + OpenShift Virtualization operators)      │
-│                                                                  │
-│  Install aba + deps:                                             │
-│  jq make python3-jinja2 podman skopeo openssl coreos-installer  │
-│                                                                  │
-│  ──────────────────────────────────────────────────────────────  │
-│  STEP 2 — Mirror Registry Setup (inside enclave)                │
-│                                                                  │
-│  aba load \                                                      │
-│    --mirror-hostname registry.example.com \                     │
-│    --retry                                                       │
-│                                                                  │
-│  → Installs mirror registry                                     │
-│  → Loads all images from bundle (10–20 min)                     │
-│  → Configures auth                                              │
-│                                                                  │
-│  ──────────────────────────────────────────────────────────────  │
-│  STEP 3 — Cluster Install                                        │
-│                                                                  │
-│  aba cluster --name prod-virt \                                  │
-│              --type standard \                                   │
-│              --starting-ip 10.0.1.100                           │
-│                                                                  │
-│  aba agentconf   → Generates install-config.yaml                │
-│  aba iso         → Creates bootable Agent ISO                   │
-│  aba mon         → Monitors installation progress               │
-└──────────────────────────────────────────────────────────────────┘
+
+```mermaid
+flowchart TD
+    A["📦 Download install bundle\n4.19.12-ocpv\nOCP + ODF + Virtualization operators"] --> B
+
+    B["🖥️ Install aba + dependencies on bastion\njq · make · python3-jinja2 · podman · skopeo\nopenssl · coreos-installer"] --> C
+
+    C["💾 Transfer bundle to enclave\nUSB / data diode / courier media"] --> D
+
+    D["aba load\n--mirror-hostname registry.example.com --retry\n\nInstalls mirror registry\nLoads all images (10–20 min)\nConfigures auth"] --> E
+
+    E["aba cluster --name prod-virt\n--type standard --starting-ip 10.0.1.100"] --> F
+
+    F["aba agentconf\nGenerates install-config.yaml + agent-config.yaml"] --> G
+
+    G["aba iso\nCreates bootable Agent ISO"] --> H
+
+    H["aba mon\nBoot servers, monitor installation"]
 ```
 
-**aba** supports:
-- SNO (Single Node OpenShift), compact (3-node), and standard (3 control + N worker) topologies
-- VLAN tagging and NIC bonding
-- oc-mirror v2
-- Multiple operator catalogue sources (Red Hat, Certified, Marketplace, Community)
-- Arm64 (tested)
+
+It supports SNO, compact (3-node), and full standard topologies, VLAN tagging, NIC bonding, oc-mirror v2, all four operator catalogue sources, and has been tested on Arm64. It's upstream/unsupported by Red Hat directly, but Red Hat does support the artefacts it generates — that's an important distinction if you're in a support-conscious environment.
 
 ---
 
-## IBM MAS and Disconnected OpenShift
+## IBM MAS on Disconnected OpenShift
 
-IBM Maximo Application Suite (MAS) is commonly deployed on OpenShift in air-gapped industrial environments. IBM's documentation for [Installing MAS on a disconnected Red Hat OpenShift cluster](https://www.ibm.com/docs/en/mas-cd?topic=setup-installing-disconnected-red-hat-openshift-cluster) follows the same core pattern:
+Worth a mention for anyone running IBM Maximo Application Suite in industrial or utilities environments — it's a common pairing. IBM's own [documentation for installing MAS on a disconnected cluster](https://www.ibm.com/docs/en/mas-cd?topic=setup-installing-disconnected-red-hat-openshift-cluster) follows exactly the same mirroring pattern covered above. You're still using `oc-mirror`, still applying ICSP, still swapping out the default OperatorHub sources. The IBM-specific bit is just layering the MAS operator catalogue on top of the base OCP/Virtualization mirror.
 
-1. Mirror images from public registries to a private registry using `oc-mirror` or `oc adm catalog mirror`
-2. Configure `ImageContentSourcePolicy` to redirect pulls
-3. Disable default `OperatorHub` sources
-4. Register mirrored catalogues as custom `CatalogSource` objects
-
-IBM's guidance also emphasises using **Red Hat Marketplace** for operator delivery, which supports a dedicated disconnected operator install flow available at the [Red Hat Marketplace disconnected cluster documentation](https://swc.saas.ibm.com/en-us/redhat-marketplace/documentation/deploy-products-to-a-disconnected-environment).
+If you're going through the [Red Hat Marketplace](https://swc.saas.ibm.com/en-us/redhat-marketplace/documentation/deploy-products-to-a-disconnected-environment) for operator delivery, there's a dedicated disconnected install flow there too.
 
 ---
 
-## VM Boot Sources in Airgapped Environments
+## VM Boot Sources — Don't Forget This
 
-By default, OpenShift Virtualization populates `DataSource` objects that reference common OS boot images hosted on Red Hat's CDN. In a disconnected environment these references will fail unless you either:
+By default, OpenShift Virtualization sets up `DataSource` objects that point at boot images hosted on Red Hat's CDN — RHEL 8, RHEL 9, Fedora, and so on. In a disconnected environment those pulls fail silently and you'll have no templates to work from until you sort it.
 
-**Option A — Disable automatic boot source imports (recommended for airgap):**
+You've got two options:
+
+**Option A — Just turn it off (easiest for airgap):**
 
 ```yaml
-# In the HyperConverged CR spec
 spec:
   featureGates:
     enableCommonBootImageImport: false
 ```
 
-**Option B — Pre-stage boot images as PVCs and create custom `DataSource` CRs:**
+**Option B — Pre-stage your boot images in the mirror and point CDI at them:**
 
 ```yaml
 apiVersion: cdi.kubevirt.io/v1beta1
@@ -424,156 +395,145 @@ spec:
         storage: 30Gi
 ```
 
+Option B is more work but gives you a proper template library inside the cluster UI. For most airgapped deployments, Option A to start and Option B when you have time is a reasonable approach.
+
 ---
 
-## Network Considerations
+## Networking
 
-OpenShift Virtualization VMs need layer-2 connectivity for many traditional workloads. Key networking components (all mirrored via the CNA operator) include:
+VM networking in OpenShift Virtualization is richer than vanilla container networking — VMs often need real layer-2 connectivity to integrate with existing infrastructure. All of the CNI components below are managed by the CNA operator and need to be in your mirror.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│  VM Networking Stack (CNA-managed)                       │
-│                                                          │
-│  ┌──────────┐    ┌──────────────┐    ┌────────────────┐  │
-│  │  VM Pod  │    │  Multus CNI  │    │  SDN / OVN-K   │  │
-│  │          │───▶│  (multi-nic) │───▶│  (pod network) │  │
-│  │  QEMU    │    └──────────────┘    └────────────────┘  │
-│  └──────────┘           │                                │
-│                         ▼                                │
-│               ┌──────────────────┐                       │
-│               │ Linux Bridge CNI │  ← trunk/access VLAN  │
-│               │ or OVS CNI       │    to physical switch  │
-│               └──────────────────┘                       │
-└──────────────────────────────────────────────────────────┘
+
+```mermaid
+graph LR
+    VM["🖥️ VM Pod\nQEMU process"] --> M["Multus CNI\nmulti-NIC attachment"]
+    M --> OVN["OVN-Kubernetes\npod/cluster network"]
+    M --> LB["Linux Bridge CNI\nor OVS CNI"]
+    LB --> SW["Physical Switch\ntrunk / access VLAN"]
 ```
 
-For VM live migration between nodes, ensure the cluster has a dedicated migration network with sufficient bandwidth (recommended: ≥10 GbE).
+
+One thing worth planning early: live migration. If you want vMotion-equivalent behaviour (and you almost certainly do), you need a dedicated migration network with enough bandwidth — Red Hat recommends ≥10 GbE. Sort the network topology before you start, not after.
 
 ---
 
-## Upgrade Considerations in Airgapped Environments
+## Upgrades in Airgapped Environments
 
-Upgrading OpenShift Virtualization in a disconnected cluster follows the same pattern as initial install:
+Upgrades follow the same pattern as the initial install, which is good news — there's no separate upgrade procedure to learn.
 
-1. Re-run `oc-mirror` (or `aba load`) with updated version ranges in the `ImageSetConfiguration`
-2. Generate and apply a fresh `ImageContentSourcePolicy` (incremental diffs are supported in oc-mirror v2)
-3. Update the `Subscription` `startingCSV` or allow OLM to auto-update within the approved channel
-4. The HCO reconciles sub-operator upgrades sequentially to minimise disruption
+1. Re-run `oc-mirror` (or `aba load`) with updated version ranges in your `ImageSetConfiguration`
+2. Apply the fresh `ImageContentSourcePolicy` — oc-mirror v2 supports incremental diffs so you're not re-shipping everything
+3. Let OLM auto-update within the approved channel, or pin the `startingCSV` manually
+4. HCO coordinates the sub-operator upgrades sequentially to keep disruption minimal
 
-For clusters managed by the **OpenShift Update Service (OSUS)**, `aba` can also configure a local OSUS instance inside the enclave, providing a graph-based update server identical to `api.openshift.com/api/upgrades_info` but served internally.
+If you're using `aba`, it can also stand up a local **OpenShift Update Service (OSUS)** instance inside the enclave — an internal copy of the `api.openshift.com` update graph server, so your cluster thinks it's talking to Red Hat when it's actually talking to something in your own network.
 
 ---
 
-## Troubleshooting Common Airgap Issues
+## When Things Go Wrong
 
-| Symptom | Likely Cause | Resolution |
+| What you're seeing | What's probably happening | What to do |
 |---|---|---|
-| `ImagePullBackOff` on virt-operator pods | ICSP not yet applied / node reboot pending | Check `oc get mcp` — wait for roll-out to complete |
-| `CatalogSource` stuck in `CONNECTING` | Mirror registry TLS cert not trusted | Add CA cert to cluster trust via `oc create configmap` in `openshift-config`, patch `image.config.openshift.io` |
-| CDI importer pod fails with `401 Unauthorized` | Pull secret missing for internal registry | Create `dockerconfigjson` secret in `openshift-virtualization-os-images` namespace |
-| Boot source PVC stuck in `Pending` | StorageClass default not set | `oc patch storageclass <name> -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'` |
-| HCO reports `ReconcileError` | Sub-operator image tag not found in mirror | Re-run oc-mirror with broader `minVersion`/`maxVersion` range to include the missing bundle |
-
----
+| `ImagePullBackOff` on virt-operator pods | ICSP applied but node reboot hasn't finished | `oc get mcp` — wait for the roll-out |
+| `CatalogSource` stuck in `CONNECTING` | Mirror registry TLS cert isn't trusted by the cluster | Add CA cert via `oc create configmap` in `openshift-config`, patch `image.config.openshift.io` |
+| CDI importer `401 Unauthorized` | Pull secret not present for the internal registry | Create a `dockerconfigjson` secret in `openshift-virtualization-os-images` |
+| Boot source PVC stuck in `Pending` | No default StorageClass set | `oc patch storageclass <name> -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'` |
+| HCO `ReconcileError` | A sub-operator image tag wasn't included in the mirror | Re-run oc-mirror with a broader `minVersion`/`maxVersion` range |
 
 ---
 
 ## Nice To Knows
 
-These are the things that don't make it into the official docs but will save you real time on a project.
+These are the things that don't really make it into the official docs but will save you real time on a project.
 
 ### 1. The Proxy Whitelist Keeps Changing — and It's Not Just Red Hat Domains
 
-If you're in a partially-connected environment and routing outbound traffic through a proxy rather than mirroring everything, you'll quickly discover that the list of hostnames you need to allow is longer than you'd expect — and it shifts between OCP releases.
-
-Red Hat publishes the [official list of required endpoints](https://docs.openshift.com/container-platform/4.17/installing/install_config/configuring-firewall.html), but in practice projects have been caught out by entries like these that aren't always obvious at first glance:
+If you're going the proxy route rather than full mirroring, you'll quickly find that the hostname list is longer than you'd expect and shifts between OCP releases. Red Hat publishes an [official endpoint list](https://docs.openshift.com/container-platform/4.17/installing/install_config/configuring-firewall.html), but these are the entries that most commonly catch people out:
 
 | Hostname | Why it's needed |
 |---|---|
 | `registry.redhat.io` | Operator and component images |
-| `quay.io` | Some operator images are hosted here, not on registry.redhat.io |
-| `cdn.quay.io` | Blob/layer storage backing quay.io pulls |
-| `cdn01.quay.io`, `cdn02.quay.io`, `cdn03.quay.io` | CDN shards — all needed, not just the apex |
-| `sso.redhat.io` | Authentication for registry.redhat.io |
-| `api.openshift.com` | Cluster telemetry, update graph (OSUS) |
-| `cert-api.access.redhat.com` | Certificate/entitlement checks |
+| `quay.io` | Some operator images live here, not on registry.redhat.io |
+| `cdn.quay.io` | Blob/layer storage backing quay.io |
+| `cdn01.quay.io`, `cdn02.quay.io`, `cdn03.quay.io` | CDN shards — the apex domain alone isn't enough |
+| `sso.redhat.io` | Auth for registry.redhat.io |
+| `api.openshift.com` | Cluster telemetry, update graph |
+| `cert-api.access.redhat.com` | Entitlement checks |
 | `access.redhat.com` | Subscription Manager |
 | `infogw.api.openshift.com` | Insights operator |
 | `console.redhat.com` | Pull secret validation, Assisted Installer |
-| `rhcos.mirror.openshift.com` | RHCOS image downloads during install |
+| `rhcos.mirror.openshift.com` | RHCOS images during install |
 | `mirror.openshift.com` | OCP release artefacts |
-| `storage.googleapis.com` | Some RHCOS artefacts are served from GCS |
+| `storage.googleapis.com` | Some RHCOS artefacts are served from Google Cloud Storage |
 
-The **GCS bucket (`storage.googleapis.com`)** is the one that most commonly surprises people — it's a Google domain and will be blocked by default in most corporate proxy policies. Raise it early with your network/security team. Similarly, `cdn01–03.quay.io` are often missed because engineers test against `quay.io` directly and assume that's sufficient.
+The `storage.googleapis.com` entry is the one that consistently surprises people — it's a Google domain, so it gets blocked by default in most corporate proxy policies. Raise it with your network/security team early. The `cdn01–03.quay.io` shards are another one that bites you because engineers test against `quay.io` directly, see it work, and assume that's sufficient.
 
-> **Practical tip:** Run `oc adm must-gather` after your first install attempt and grep the logs for `connection refused` or `dial tcp` errors. This will surface any missing proxy entries far faster than auditing the docs manually.
-
-If you're fully airgapped (no proxy at all), this is less relevant — but keep the list handy for the day someone asks you to justify why 14 external hostnames were in the change request.
+**Practical tip:** after your first install attempt, run `oc adm must-gather` and grep the collected logs for `connection refused` or `dial tcp`. That'll surface missing proxy entries much faster than trying to audit the docs.
 
 ---
 
 ### 2. Coming from VMware? Tell Your AI Assistant That Up Front
 
-OpenShift Virtualization is a fundamentally different model from vSphere, but the *concepts* map reasonably well once you have the right translation layer. If you're using an AI coding assistant or chat tool to help you work through configuration problems, **start every conversation with your background**. Something like:
+The conceptual model in OpenShift Virtualization is genuinely different from vSphere — but it's not alien once you have the right mental map. If you're using an AI assistant to help with config problems, start your session with something like:
 
-> "I have 10 years of VMware vSphere/NSX-T experience. I'm new to OpenShift Virtualization / KubeVirt. Please explain concepts by comparing them to VMware equivalents where possible."
+> "I have 10 years of VMware vSphere and NSX-T experience. I'm learning OpenShift Virtualization / KubeVirt. Please compare concepts to VMware equivalents where it's helpful."
 
-This single prompt change dramatically improves the quality of explanations. For example, an AI that knows your background will naturally explain things like:
+That one sentence changes the quality of answers significantly. An AI that knows your context will translate naturally rather than explaining concepts from scratch. Here's the cheat sheet:
 
-| VMware concept | OpenShift Virtualization equivalent |
+| VMware | OpenShift Virtualization |
 |---|---|
 | vCenter | OCP Console + `virtctl` CLI |
 | ESXi host | Worker node running `virt-handler` (DaemonSet) |
 | VM snapshot | `VirtualMachineSnapshot` CR |
 | vMotion (live migration) | `VirtualMachineInstanceMigration` CR |
-| OVA / OVF import | CDI `DataVolume` with HTTP/registry source |
+| OVA / OVF import | CDI `DataVolume` with HTTP or registry source |
 | Distributed vSwitch (VDS) | OVN-Kubernetes + Multus + Linux Bridge CNI |
-| NSX-T micro-segmentation | OCP NetworkPolicy + optional NMState |
+| NSX-T micro-segmentation | OCP NetworkPolicy + NMState |
 | VMFS / vSAN datastore | OpenShift Data Foundation (ODF) / StorageClass |
 | Content Library | `DataSource` + `DataImportCron` in openshift-virtualization-os-images |
-| HA / DRS cluster | Kubernetes scheduler + pod disruption budgets |
+| HA / DRS | Kubernetes scheduler + pod disruption budgets |
 
-The mapping isn't always 1:1, but having this vocabulary bridge makes searching documentation and interpreting error messages much faster — especially in the early weeks of a project.
+It's not 1:1 in every case — the Kubernetes abstraction model means some things work differently at a fundamental level — but having this vocabulary bridge makes you productive much faster.
 
 ---
 
 ### 3. Third-Party CNI / CSI Registries — Get the URLs Before You Start
 
-If your architecture calls for a third-party CNI (e.g. Calico, Cilium, SR-IOV Network Operator) or a CSI driver (e.g. NetApp Trident, Pure Storage PSO, Dell CSI), **collect every image registry and endpoint those components need before you raise your first firewall change request**.
+This one is responsible for a genuinely painful number of project delays. If your design includes a third-party CNI (Calico, Cilium, SR-IOV Network Operator) or a CSI driver (NetApp Trident, Pure Storage PSO, Dell CSI), you need every image registry and endpoint for those components **before you raise your first firewall change request**.
 
-This is one of the most common causes of project delays in airgapped deployments:
+Here's how it plays out when you don't:
 
 ```
-Week 1  → OCP base cluster installs fine (Red Hat domains whitelisted)
-Week 3  → OpenShift Virtualization installs fine (same domain set)
-Week 5  → Calico operator fails — pulls from quay.io/tigera/...
-          Firewall change request raised. Change window: 2 weeks.
-Week 7  → Calico up, but Trident fails — pulls from docker.io/netapp/...
+Week 1  → OCP base cluster installs fine
+Week 3  → OpenShift Virtualization installs fine
+Week 5  → Calico fails — pulls from quay.io/tigera
+          Firewall change request raised. 2-week change window.
+Week 7  → Calico up. Trident fails — pulls from docker.io/netapp
           Another change request. Another 2 weeks.
-Week 9  → You're 4 weeks behind schedule.
+Week 9  → 4 weeks behind. Nobody is happy.
 ```
 
-Do a **single, comprehensive image audit at the start of the project**. For each third-party component, check:
+Do a single comprehensive image audit at the start of the project. For each third-party component:
 
-1. **Operator bundle images** — what registry does OLM pull the operator itself from?
-2. **Operand images** — what registry do the pods the operator deploys pull from?
-3. **Init/sidecar images** — often overlooked; grep the operator's CSV for `image:` fields
-4. **Helm chart images** — if the component ships via Helm, check `values.yaml` for every `repository:` key
+1. **Operator bundle images** — what registry does OLM pull the operator from?
+2. **Operand images** — what do the pods the operator deploys pull from?
+3. **Init/sidecar images** — easy to miss; grep the operator CSV for every `image:` field
+4. **Helm chart images** — if it ships via Helm, check `values.yaml` for every `repository:` key
 
-A quick way to extract all image references from an operator bundle before installing:
+Quick ways to check before you install:
 
 ```bash
-# Pull the operator bundle and inspect all image references
+# Check what's in an operator bundle
 oc mirror list operators \
   --catalog=registry.redhat.io/redhat/redhat-operator-index:v4.17 \
   --package=sriov-network-operator \
   --channel=stable
 
-# For a Helm chart, extract every unique registry
+# Extract all image refs from a Helm chart
 helm template <release> <chart> | grep 'image:' | sort -u
 ```
 
-Common third-party registries that appear in OpenShift Virtualization adjacent deployments:
+Common third-party registries that show up in OpenShift Virtualization-adjacent deployments:
 
 | Component | Registry |
 |---|---|
@@ -581,14 +541,14 @@ Common third-party registries that appear in OpenShift Virtualization adjacent d
 | Cilium | `quay.io/cilium` |
 | SR-IOV (upstream) | `ghcr.io/k8snetworkplumbingwg` |
 | NetApp Trident | `docker.io/netapp` |
-| Rook/Ceph | `quay.io/ceph`, `quay.io/cephcsi` |
+| Rook / Ceph | `quay.io/ceph`, `quay.io/cephcsi` |
 | Longhorn | `docker.io/longhornio` |
 | Cert-manager | `quay.io/jetstack` |
 | MetalLB | `quay.io/metallb` |
 
-Note that `docker.io` (Docker Hub) has rate limiting even before you consider firewall rules. If any of your components pull from Docker Hub, factor in either a paid Docker account, a mirror, or an explicit pull-through cache — and make sure that's in the firewall request too.
+Also worth noting: `docker.io` (Docker Hub) has rate limiting on unauthenticated pulls, independent of any firewall questions. If anything in your stack pulls from there, factor in either a paid Docker account, a pull-through cache, or mirroring those images to your internal registry. And yes — that needs to be in the firewall request too.
 
-> **Bottom line:** Treat the registry/URL audit as a project deliverable on day one, not a task for when things start failing.
+Treat the registry/URL audit as a project deliverable on day one, not something you get to when things start failing.
 
 ---
 
